@@ -587,6 +587,34 @@ local function powerStatus()
 	if #list == 0 then return "no Power Box prompts found in Map.Tiles" end
 	return #list .. " power plants found"
 end
+local function restartRound()
+	local _, hum = getChar()
+	log("resetting the character")
+	pcall(function() hum.Health = 0 end)
+	pcall(function() hum:ChangeState(Enum.HumanoidStateType.Dead) end)
+	local start = os.clock()
+	local presses = 0
+	while alive() and os.clock() - start < 90 do
+		local pg = player:FindFirstChildOfClass("PlayerGui")
+		local ui = pg and pg:FindFirstChild("DownedUI")
+		local lost = ui and ui:FindFirstChild("Lost")
+		local btn = lost and lost:FindFirstChild("PlayAgain")
+		local shown = btn and ui.Enabled and lost.Visible and btn.Visible
+		if shown and presses < 10 then
+			presses += 1
+			log("pressing PlayAgain (" .. presses .. ")")
+			pressButton(btn)
+			task.wait(1)
+		elseif presses > 0 and not shown then
+			break
+		else
+			task.wait(0.2)
+		end
+	end
+	sprintBtn = nil
+	sprintOn = false
+	log(presses > 0 and "PlayAgain pressed" or "PlayAgain button never appeared")
+end
 local stored = 0
 local function collect(target)
 	local lastNotice = -100
@@ -645,12 +673,13 @@ local function trip()
 		task.wait(1)
 	end
 	setSprint(false)
+	if powerDone and alive() then restartRound() end
 end
-waitForCutscenes(90)
 log("scanning for fuel... " .. fuelStatus())
 while alive() do
 	local ok, err = pcall(function()
 		getChar()
+		waitForCutscenes(90)
 		trip()
 	end)
 	if not ok then
