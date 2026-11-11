@@ -50,14 +50,6 @@ local function pressButton(btn)
 	end
 	return fired
 end
-local function getSprintButton()
-	local ok, btn = pcall(function()
-		return player.PlayerGui:WaitForChild("DeviceSupportUI", 5)
-			:WaitForChild("TouchButtons", 5)
-			:WaitForChild("Sprint", 5)
-	end)
-	return ok and btn or nil
-end
 local avoidOn = true
 local flee
 local function charPos(m)
@@ -110,6 +102,7 @@ local function walkTo(targetPos, stopDist, stopCheck, timeout, noAvoid)
 	local startT = os.clock()
 	local stuckCount = 0
 	local stuckSpots = {}
+	local agentRadius = 1.5
 	local repeats = 0
 	local dodge = false
 	local lastScan = 0
@@ -131,7 +124,7 @@ local function walkTo(targetPos, stopDist, stopCheck, timeout, noAvoid)
 	while not done() and not timedOut() do
 		if not noAvoid and avoidOn and #threatsWithin(10) > 0 then flee() end
 		local path = PathfindingService:CreatePath({
-			AgentRadius = 1.5,
+			AgentRadius = agentRadius,
 			AgentHeight = 5,
 			AgentCanJump = true,
 			WaypointSpacing = 4,
@@ -151,6 +144,7 @@ local function walkTo(targetPos, stopDist, stopCheck, timeout, noAvoid)
 					if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
 					hum:MoveTo(wp.Position)
 					local lastPos, lastMove = hrp.Position, os.clock()
+					local checkAt, checkPos
 					while not done() and not timedOut() do
 						task.wait(0.05)
 						if not noAvoid and avoidOn and os.clock() - lastScan > 0.25 then
@@ -166,12 +160,21 @@ local function walkTo(targetPos, stopDist, stopCheck, timeout, noAvoid)
 						end
 						if (hrp.Position - lastPos).Magnitude > 1.5 then
 							lastPos, lastMove = hrp.Position, os.clock()
+							checkAt = nil
 						else
 							local idle = os.clock() - lastMove
 							if idle > 1.5 then hum.Jump = true end
-							if idle > 3 then
-								stuck = true
-								break
+							if idle > 3 and not checkAt then
+								checkAt, checkPos = os.clock() + 5, hrp.Position
+								log("not moving, rechecking in 5s")
+							end
+							if checkAt and os.clock() >= checkAt then
+								if (hrp.Position - checkPos).Magnitude < 1.5 then
+									stuck = true
+									break
+								end
+								checkAt = nil
+								lastPos, lastMove = hrp.Position, os.clock()
 							end
 						end
 					end
@@ -196,7 +199,9 @@ local function walkTo(targetPos, stopDist, stopCheck, timeout, noAvoid)
 					hum:MoveTo(hrp.Position)
 					return false
 				end
-				if stuckCount >= 2 then sidestep() end
+				agentRadius = math.min(agentRadius + 1, 4)
+				log("still stuck after 5s, rerouting (agent radius " .. agentRadius .. ")")
+				sidestep()
 			elseif not done() then
 				hum:MoveTo(targetPos)
 				local t = os.clock()
@@ -475,16 +480,26 @@ local function waitForCutscenes(maxWait)
 	warn("[FuelHauler] cutscene still busy after " .. maxWait .. "s, continuing anyway")
 	return false
 end
-local sprintBtn
-local sprintOn = false
-local function setSprint(want)
-	if want == sprintOn then return end
-	sprintBtn = sprintBtn or getSprintButton()
-	if sprintBtn then
-		pressButton(sprintBtn)
-		sprintOn = want
+local speedActive = true
+local baseSpeed = 16
+task.spawn(function()
+	local seen
+	while alive() and speedActive do
+		local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+		if hum then
+			if hum ~= seen then
+				seen = hum
+				if hum.WalkSpeed ~= 32 then baseSpeed = hum.WalkSpeed end
+			end
+			if hum.WalkSpeed ~= 32 then hum.WalkSpeed = 32 end
+		end
+		task.wait(0.1)
 	end
-end
+	if alive() and not speedActive then
+		local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+		if hum then hum.WalkSpeed = baseSpeed end
+	end
+end)
 local function fuelStatus()
 	local folder = workspace:FindFirstChild("DroppedItems")
 	if not folder then return "workspace.DroppedItems does not exist yet" end
@@ -544,7 +559,6 @@ local function doPowerBox(target)
 	local fired = false
 	local ok, err = pcall(function()
 		local _, hum, hrp = getChar()
-		setSprint(true)
 		local range = prompt.MaxActivationDistance
 		local function inRange() return not prompt.Parent or (hrp.Position - pos).Magnitude <= range - 1 end
 		walkTo(pos, math.max(range - 2, 3), inRange, 60, true)
@@ -611,8 +625,6 @@ local function restartRound()
 			task.wait(0.2)
 		end
 	end
-	sprintBtn = nil
-	sprintOn = false
 	log(presses > 0 and "PlayAgain pressed" or "PlayAgain button never appeared")
 end
 local stored = 0
@@ -634,7 +646,6 @@ local function collect(target)
 			while fuel.Parent and fuel:GetAttribute("JustSpawned") == true and os.clock() - t < 5 do
 				task.wait(0.2)
 			end
-			setSprint(true)
 			if grabOne(fuel) then
 				stored += 1
 				log("stored " .. stored .. "/" .. target)
@@ -646,7 +657,6 @@ local function trip()
 	while phase <= #FUEL_TRIPS and alive() do
 		collect(FUEL_TRIPS[phase])
 		while stored > 0 and alive() do
-			setSprint(true)
 			if goToZoneAndDrop(stored) then
 				stored = 0
 			else
@@ -672,7 +682,6 @@ local function trip()
 		end
 		task.wait(1)
 	end
-	setSprint(false)
 	if powerDone and alive() then restartRound() end
 end
 log("scanning for fuel... " .. fuelStatus())
@@ -693,5 +702,5 @@ while alive() do
 		phase = 1
 	end
 end
-setSprint(false)
+speedActive = false
 print("[FuelHauler] finished")
