@@ -95,6 +95,31 @@ local function onMap(pos)
 	end
 	return rayTile(pos, tiles)
 end
+local blockers = {}
+local function purgeBlockers(all)
+	for i = #blockers, 1, -1 do
+		local b = blockers[i]
+		if all or os.clock() > b.expires then
+			b.part:Destroy()
+			table.remove(blockers, i)
+		end
+	end
+end
+local function addBlocker(pos)
+	local part = Instance.new("Part")
+	part.Name = tostring(rand:NextInteger(100000, 999999))
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.Transparency = 1
+	part.Size = Vector3.new(6, 12, 6)
+	part.CFrame = CFrame.new(pos)
+	local mod = Instance.new("PathfindingModifier")
+	mod.Label = "Blocked"
+	mod.Parent = part
+	part.Parent = workspace
+	table.insert(blockers, { part = part, expires = os.clock() + 90 })
+end
 local function walkTo(targetPos, stopDist, stopCheck, timeout, noAvoid)
 	local _, hum, hrp = getChar()
 	stopDist = stopDist or 4
@@ -102,10 +127,11 @@ local function walkTo(targetPos, stopDist, stopCheck, timeout, noAvoid)
 	local startT = os.clock()
 	local stuckCount = 0
 	local stuckSpots = {}
-	local agentRadius = 1.5
 	local repeats = 0
+	local agentRadius = 2
 	local dodge = false
 	local lastScan = 0
+	purgeBlockers(false)
 	local function flat(a, b)
 		return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
 	end
@@ -116,11 +142,6 @@ local function walkTo(targetPos, stopDist, stopCheck, timeout, noAvoid)
 	local function timedOut()
 		return os.clock() - startT > timeout or not alive()
 	end
-	local function sidestep()
-		hum.Jump = true
-		hum:MoveTo(hrp.Position + Vector3.new(rand:NextNumber(-6, 6), 0, rand:NextNumber(-6, 6)))
-		task.wait(0.4)
-	end
 	while not done() and not timedOut() do
 		if not noAvoid and avoidOn and #threatsWithin(10) > 0 then flee() end
 		local path = PathfindingService:CreatePath({
@@ -128,10 +149,12 @@ local function walkTo(targetPos, stopDist, stopCheck, timeout, noAvoid)
 			AgentHeight = 5,
 			AgentCanJump = true,
 			WaypointSpacing = 4,
+			Costs = { Blocked = math.huge },
 		})
 		local ok = pcall(function() path:ComputeAsync(hrp.Position, targetPos) end)
 		if ok and path.Status == Enum.PathStatus.Success then
 			local stuck = false
+			local stuckDir = Vector3.new(0, 0, 1)
 			local wps = path:GetWaypoints()
 			if #wps > 0 and (wps[#wps].Position - targetPos).Magnitude > math.max(12, stopDist + 6) then
 				log("no real route to the target, giving up")
@@ -143,8 +166,10 @@ local function walkTo(targetPos, stopDist, stopCheck, timeout, noAvoid)
 					if done() or timedOut() or stuck or dodge then break end
 					if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
 					hum:MoveTo(wp.Position)
-					local lastPos, lastMove = hrp.Position, os.clock()
-					local checkAt, checkPos
+					local best = flat(hrp.Position, wp.Position)
+					local bestAt = os.clock()
+					local wpStart = os.clock()
+					local checkAt
 					while not done() and not timedOut() do
 						task.wait(0.05)
 						if not noAvoid and avoidOn and os.clock() - lastScan > 0.25 then
@@ -154,28 +179,27 @@ local function walkTo(targetPos, stopDist, stopCheck, timeout, noAvoid)
 								break
 							end
 						end
-						if flat(hrp.Position, wp.Position) < 2.5 then
+						local d = flat(hrp.Position, wp.Position)
+						if d < 2 then
 							stuckCount = 0
 							break
 						end
-						if (hrp.Position - lastPos).Magnitude > 1.5 then
-							lastPos, lastMove = hrp.Position, os.clock()
+						if d < best - 1 then
+							best, bestAt = d, os.clock()
 							checkAt = nil
-						else
-							local idle = os.clock() - lastMove
-							if idle > 1.5 then hum.Jump = true end
-							if idle > 3 and not checkAt then
-								checkAt, checkPos = os.clock() + 5, hrp.Position
-								log("not moving, rechecking in 5s")
-							end
-							if checkAt and os.clock() >= checkAt then
-								if (hrp.Position - checkPos).Magnitude < 1.5 then
-									stuck = true
-									break
-								end
-								checkAt = nil
-								lastPos, lastMove = hrp.Position, os.clock()
-							end
+						end
+						local idle = os.clock() - bestAt
+						if idle > 1.5 then hum.Jump = true end
+						if idle > 3 and not checkAt then
+							checkAt = os.clock() + 5
+							log("not making progress, rechecking in 5s")
+						end
+						if (checkAt and os.clock() >= checkAt) or os.clock() - wpStart > 12 then
+							stuck = true
+							local v = wp.Position - hrp.Position
+							v = Vector3.new(v.X, 0, v.Z)
+							if v.Magnitude > 0.1 then stuckDir = v.Unit end
+							break
 						end
 					end
 				end
@@ -193,15 +217,17 @@ local function walkTo(targetPos, stopDist, stopCheck, timeout, noAvoid)
 					end
 				end
 				table.insert(stuckSpots, here)
-				log("stuck, re-pathing (" .. stuckCount .. ")")
-				if repeats >= 2 or #stuckSpots >= 5 then
+				if repeats >= 2 or #stuckSpots >= 4 then
 					log("blocked by a wall, giving up on this target")
 					hum:MoveTo(hrp.Position)
 					return false
 				end
-				agentRadius = math.min(agentRadius + 1, 4)
-				log("still stuck after 5s, rerouting (agent radius " .. agentRadius .. ")")
-				sidestep()
+				addBlocker(here + stuckDir * 5)
+				agentRadius = math.min(agentRadius + 0.5, 4)
+				log("still stuck after 5s, rerouting around the obstacle (" .. stuckCount .. ")")
+				hum.Jump = true
+				hum:MoveTo(here - stuckDir * 6)
+				task.wait(0.5)
 			elseif not done() then
 				hum:MoveTo(targetPos)
 				local t = os.clock()
@@ -702,5 +728,6 @@ while alive() do
 		phase = 1
 	end
 end
+purgeBlockers(true)
 speedActive = false
 print("[FuelHauler] finished")
