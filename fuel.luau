@@ -1,3 +1,4 @@
+if game.PlaceId == 116139828947259 then
 local env = (getgenv and getgenv()) or _G
 local FUEL_TRIPS = { 2, 5 }
 local BACKPACK_CAPACITY = 10
@@ -1118,3 +1119,4 @@ setStatus("finished")
 clearDots()
 if dotFolder then dotFolder:Destroy() end
 print("[FuelHauler] finished")
+end
