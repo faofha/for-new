@@ -1,0 +1,543 @@
+-- Endless Night Solo Survivor (Standalone + Auto-Retry)
+-- Works via execute, live-reload, and auto-persists across VotePlayAgain teleports.
+
+local FULL_SOURCE = [=[
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local PathfindingService = game:GetService("PathfindingService")
+
+local lp = Players.LocalPlayer
+while not lp do task.wait(0.1); lp = Players.LocalPlayer end
+
+-- Cleanly stop any previous instance
+getgenv().__ENDLESS_RUN_ID = (getgenv().__ENDLESS_RUN_ID or 0) + 1
+local MY_RUN_ID = getgenv().__ENDLESS_RUN_ID
+
+local function isAlive()
+  if getgenv().__ENDLESS_RUN_ID ~= MY_RUN_ID then return false end
+  if STATE and STATE.alive and not STATE.alive() then return false end
+  return true
+end
+
+-- Lobby guard: never join multiplayer lobbies automatically
+if game.PlaceId == 80046280333935 then
+  warn("[EndlessSurvivor] In Lobby. Start a solo Endless Night match to begin.")
+  return
+end
+
+-- Wait for Eternal Night game systems
+local Bullet = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Combat"):WaitForChild("Bullet"))
+local PickUpItem = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Interaction"):WaitForChild("PickUpItem")
+local VotePlayAgain = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Misc"):WaitForChild("VotePlayAgain")
+
+local MELEE_RANK = {
+  ["Infernal Scythe"] = 100, ["Scorchblade"] = 95, ["Trident"] = 90, ["Power Hammer"] = 85,
+  ["Energy Blade"] = 80, ["Chainsaw"] = 75, ["Bloodthirster"] = 70, ["Katana"] = 65,
+  ["Fire Axe"] = 60, ["Sledgehammer"] = 55, ["Scythe"] = 50, ["Spear"] = 48, ["Spiked Bat"] = 45,
+  ["Crowbar"] = 40, ["Hatchet"] = 30, ["Bat"] = 10
+}
+
+local GUN_RANK = {
+  ["Deathbringer Cannon"] = 120, ["Railgun"] = 110, ["Minigun"] = 105, ["Ray Gun"] = 100,
+  ["AA-12"] = 95, ["LMG"] = 90, ["Assault Rifle"] = 85, ["AK-47"] = 80, ["Combat SMG"] = 75,
+  ["Rifle"] = 70, ["Heavy Sniper"] = 68, ["Sniper"] = 65, ["SVD"] = 63, ["Shotgun"] = 60,
+  ["Double Barrel"] = 58, ["Uzi"] = 55, ["Infiltrator Uzi"] = 56, ["Desert Eagle"] = 50,
+  ["Heavy Revolver"] = 48, ["Revolver"] = 45, ["Pistol"] = 30
+}
+
+local ARMOR_RANK = {
+  ["Light Armor"] = 1, ["Medium Armor"] = 2, ["Heavy Armor"] = 3
+}
+
+local function getChar() return lp.Character end
+
+local function setSprint(char, on)
+  if not char then return end
+  local hunger = char:GetAttribute("Hunger") or 0
+  if on and hunger <= 2 then on = false end
+  if char:GetAttribute("SprintingClient") ~= on then
+    char:SetAttribute("SprintingClient", on)
+  end
+  local wsClient = char:FindFirstChild("WalkSpeedClient")
+  local sprintRemote = wsClient and wsClient:FindFirstChild("Sprint")
+  if sprintRemote then
+    pcall(function() sprintRemote:FireServer(on) end)
+  end
+end
+
+local function isZombie(m)
+  if not m:IsA("Model") or m == lp.Character then return false end
+  if m:HasTag("Player") or m:GetAttribute("Player") or m:GetAttribute("Ally") then return false end
+  if m:GetAttribute("Dead") then return false end
+  local hum = m:FindFirstChildOfClass("Humanoid") or m:FindFirstChild("MockHumanoid")
+  if not hum or hum.Health <= 0 then return false end
+  return true
+end
+
+local function findTool(name)
+  local char = getChar()
+  if char then
+    local t = char:FindFirstChild(name)
+    if t and t:IsA("Tool") then return t end
+  end
+  return lp.Backpack:FindFirstChild(name)
+end
+
+local function getBestMelee()
+  local char = getChar()
+  local best, bestScore = nil, -1
+  for _, container in ipairs({lp.Backpack, char}) do
+    if container then
+      for _, t in ipairs(container:GetChildren()) do
+        if t:IsA("Tool") and t:GetAttribute("ToolType") == "Melee" then
+          local sc = MELEE_RANK[t.Name] or 20
+          if sc > bestScore then bestScore = sc; best = t end
+        end
+      end
+    end
+  end
+  return best, bestScore
+end
+
+local function getBestGun(requireAmmo)
+  local char = getChar()
+  local best, bestScore = nil, -1
+  for _, container in ipairs({lp.Backpack, char}) do
+    if container then
+      for _, t in ipairs(container:GetChildren()) do
+        if t:IsA("Tool") and t:GetAttribute("ToolType") == "Gun" then
+          local stats = t:FindFirstChild("Stats")
+          local ammoType = stats and stats:GetAttribute("AmmoType")
+          local mag = t:GetAttribute("Ammo") or 0
+          local reserve = ammoType and lp:FindFirstChild("Ammo") and (lp.Ammo:GetAttribute(ammoType) or 0) or 0
+          if not requireAmmo or mag > 0 or reserve > 0 then
+            local sc = GUN_RANK[t.Name] or 20
+            if sc > bestScore then bestScore = sc; best = t end
+          end
+        end
+      end
+    end
+  end
+  return best, bestScore
+end
+
+local function findSupplyCrate()
+  local map = workspace:FindFirstChild("Map")
+  local special = map and map:FindFirstChild("Special")
+  if not special then return nil, nil, nil end
+  for _, c in ipairs(special:GetChildren()) do
+    if c.Name:lower():find("supply") or c.Name:lower():find("crate") then
+      local prompt = c:FindFirstChildWhichIsA("ProximityPrompt", true)
+      if prompt and prompt.Enabled then
+        return c, prompt, c:GetPivot().Position
+      end
+    end
+  end
+  return nil, nil, nil
+end
+
+local usingMed = false
+local reloading = false
+local queuedRetry = false
+local lastAttack = 0
+local lastShot = 0
+local shotCounter = 0
+local lastPickup = 0
+local lastCrateFire = 0
+local lastVote = 0
+local stuckTicks = 0
+local itemBlacklist = {}
+local currentTargetKey = nil
+local currentWaypoints = {}
+local currentWpIdx = 1
+local lastPathTime = 0
+local lastTargetDist = 999
+local noProgressTicks = 0
+
+task.spawn(function()
+  while isAlive() do
+    local now = os.clock()
+
+    -- 0. Auto-Retry on Death / GameOver (Solo)
+    local char0 = getChar()
+    local hum0 = char0 and char0:FindFirstChildOfClass("Humanoid")
+    local isReallyDead = workspace:GetAttribute("GameOver") or (char0 and char0:GetAttribute("Dead")) or (hum0 and hum0.Health <= 0)
+
+    if isReallyDead then
+      -- Find healing drone tagged to this player
+      local healingDrone = nil
+      for _, c in ipairs(workspace:GetChildren()) do
+        if c.Name == "Healing Drone" and c:HasTag(tostring(lp.UserId)) then
+          healingDrone = c
+          break
+        end
+      end
+
+      local selfReviveCD = healingDrone and (healingDrone:GetAttribute("SelfReviveCD") or 0) or 0
+
+      -- 1) If drone revive is ready (CD <= 0), record timestamp and wait for drone
+      if healingDrone and selfReviveCD <= 0 then
+        getgenv().__LAST_DRONE_REVIVE_TIME = now
+        task.wait(0.5)
+        continue
+      end
+
+      -- 2) Prevent pressing Play Again right after drone uses revive ability (8s grace period)
+      local timeSinceRevive = now - (getgenv().__LAST_DRONE_REVIVE_TIME or 0)
+      if healingDrone and timeSinceRevive < 8 then
+        task.wait(0.5)
+        continue
+      end
+
+      -- 3) Press Play Again only if no drone or cooldown > 60s and character is still dead
+      local shouldPlayAgain = (not healingDrone) or (selfReviveCD > 60 and hum0 and hum0.Health <= 0)
+
+      if shouldPlayAgain then
+        if not queuedRetry and type(queue_on_teleport) == "function" then
+          queuedRetry = true
+          pcall(function() queue_on_teleport(getgenv().__ENDLESS_FULL_SOURCE) end)
+        end
+        if #Players:GetPlayers() <= 1 and now - lastVote > 2 then
+          lastVote = now
+          pcall(function() VotePlayAgain:FireServer() end)
+        end
+      end
+
+      task.wait(0.5)
+      continue
+    end
+
+    local char = getChar()
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not (char and hum and hrp and hum.Health > 0) then
+      task.wait(0.25)
+      continue
+    end
+
+    setSprint(char, not usingMed)
+
+    -- 1. Emergency Heal
+    if not usingMed and hum.Health < 65 and not char:GetAttribute("Downed") then
+      local med = findTool("Medkit") or findTool("Bandage")
+      if med then
+        usingMed = true
+        task.spawn(function()
+          pcall(function()
+            hum:EquipTool(med)
+            task.wait(0.05)
+            local beginUse = med:FindFirstChild("BeginUse")
+            local endUse = med:FindFirstChild("EndUse")
+            local stats = med:FindFirstChild("Stats")
+            local useTime = (stats and stats:GetAttribute("UseTime")) or 3
+            if beginUse and endUse then
+              beginUse:FireServer()
+              task.wait(useTime + 0.1)
+              if isAlive() then endUse:FireServer(true) end
+            end
+          end)
+          usingMed = false
+        end)
+      end
+    end
+
+    -- 2. Scan zombies
+    local myPos = hrp.Position
+    local repulse = Vector3.zero
+    local nearestZombie, nearestDist = nil, 999
+    local nearbyTargets = {}
+    local charsFolder = workspace:FindFirstChild("Characters")
+    if charsFolder then
+      for _, m in ipairs(charsFolder:GetChildren()) do
+        if isZombie(m) then
+          local zPos = m:GetPivot().Position
+          local diff = myPos - zPos
+          local flat = Vector3.new(diff.X, 0, diff.Z)
+          local d = flat.Magnitude
+          if d < nearestDist then nearestDist = d; nearestZombie = m end
+          if d < 12 then table.insert(nearbyTargets, m) end
+          if d < 55 and d > 0.1 then
+            local weight = 1 / (d * d)
+            if m.Name == "Runner" or m.Name == "Spitter" or m.Name == "Bloater" or m.Name == "Leaper" then
+              weight = weight * 2.2
+            end
+            repulse = repulse + flat.Unit * weight * 150
+          end
+        end
+      end
+    end
+
+    -- 3. Open Supply Crate if nearby & auto-pickup items (<= 12 studs)
+    local crateModel, cratePrompt, cratePos = findSupplyCrate()
+    if cratePrompt and cratePos and (cratePos - myPos).Magnitude <= 14 and now - lastCrateFire > 0.5 then
+      lastCrateFire = now
+      pcall(function() fireproximityprompt(cratePrompt) end)
+    end
+
+    local hunger = char:GetAttribute("Hunger") or 100
+    local myArmorRank = ARMOR_RANK[char:GetAttribute("Armor") or ""] or 0
+    local droppedFolder = workspace:FindFirstChild("DroppedItems")
+    if droppedFolder and now - lastPickup > 0.2 then
+      lastPickup = now
+      local _, myBestMeleeScore = getBestMelee()
+      local _, myBestGunScore = getBestGun(false)
+      for _, item in ipairs(droppedFolder:GetChildren()) do
+        local d = (item:GetPivot().Position - myPos).Magnitude
+        if d <= 12 then
+          local it = item:GetAttribute("ItemType")
+          local tt = item:GetAttribute("ToolType")
+          local shouldTake = false
+          if it == "Ammo" or it == "Resource" then
+            shouldTake = true
+          elseif it == "Armor" and (ARMOR_RANK[item.Name] or 1) > myArmorRank then
+            shouldTake = true
+          elseif it == "Food" and hunger < 92 then
+            shouldTake = true
+          elseif (it == "Medical" or item.Name == "Medkit" or item.Name == "Bandage") then
+            shouldTake = true
+          elseif tt == "Gun" and not findTool(item.Name) and (GUN_RANK[item.Name] or 20) >= myBestGunScore then
+            shouldTake = true
+          elseif tt == "Melee" and (MELEE_RANK[item.Name] or 20) > myBestMeleeScore then
+            shouldTake = true
+          end
+          if shouldTake then
+            pcall(function() PickUpItem:FireServer(item) end)
+          end
+        end
+      end
+    end
+
+    -- 4. Movement: Kite if zombies near, else Pathfind to Supply Crate or best loot
+    if nearestDist <= 28 then
+      local centerBias = Vector3.new(-myPos.X, 0, -myPos.Z)
+      if centerBias.Magnitude > 250 then centerBias = centerBias.Unit * 0.7 else centerBias = Vector3.zero end
+      local moveDir = repulse + centerBias
+      if moveDir.Magnitude < 0.05 then
+        local angle = now * 0.7
+        moveDir = Vector3.new(math.cos(angle), 0, math.sin(angle))
+      end
+      hum:MoveTo(myPos + moveDir.Unit * 24)
+    else
+      local targetObj, targetPos = nil, nil
+      if crateModel and cratePos and (not itemBlacklist[crateModel] or itemBlacklist[crateModel] < now) then
+        targetObj = crateModel
+        targetPos = cratePos
+      elseif droppedFolder then
+        local bestLoot, bestLootScore = nil, -1
+        local _, myBestMeleeScore = getBestMelee()
+        local _, myBestGunScore = getBestGun(false)
+        for _, item in ipairs(droppedFolder:GetChildren()) do
+          if not itemBlacklist[item] or itemBlacklist[item] < now then
+            local p = item:GetPivot().Position
+            if math.abs(p.Y - myPos.Y) < 12 then
+              local d = (p - myPos).Magnitude
+              if d < 500 then
+                local it = item:GetAttribute("ItemType")
+                local tt = item:GetAttribute("ToolType")
+                local prio = 0
+                if it == "Food" and hunger < 75 then prio = 140
+                elseif (item.Name == "Medkit" or item.Name == "Bandage") and not findTool("Medkit") then prio = 125
+                elseif it == "Armor" and (ARMOR_RANK[item.Name] or 1) > myArmorRank then prio = 120
+                elseif tt == "Gun" and not findTool(item.Name) and (GUN_RANK[item.Name] or 20) > myBestGunScore then prio = 115
+                elseif tt == "Melee" and (MELEE_RANK[item.Name] or 20) > myBestMeleeScore then prio = 105
+                elseif it == "Ammo" then prio = 55
+                elseif it == "Resource" then prio = 45
+                end
+                if prio > 0 then
+                  local score = prio - d * 0.25
+                  if score > bestLootScore then bestLootScore = score; bestLoot = item; targetPos = p end
+                end
+              end
+            end
+          end
+        end
+        targetObj = bestLoot
+      end
+
+      if targetObj and targetPos then
+        local dToTarget = (targetPos - myPos).Magnitude
+        if targetObj ~= currentTargetKey then
+          currentTargetKey = targetObj
+          lastTargetDist = dToTarget
+          noProgressTicks = 0
+          lastPathTime = 0
+        else
+          if dToTarget < lastTargetDist - 1.5 then
+            lastTargetDist = dToTarget
+            noProgressTicks = 0
+          else
+            noProgressTicks = noProgressTicks + 1
+            if noProgressTicks > 35 then
+              itemBlacklist[targetObj] = now + 25
+              currentTargetKey = nil
+              currentWaypoints = {}
+            end
+          end
+        end
+
+        if now - lastPathTime > 1.2 or #currentWaypoints == 0 then
+          lastPathTime = now
+          local path = PathfindingService:CreatePath({AgentRadius = 2.5, AgentHeight = 5, AgentCanJump = true})
+          local ok = pcall(function() path:ComputeAsync(myPos, targetPos) end)
+          if ok and path.Status == Enum.PathStatus.Success then
+            currentWaypoints = path:GetWaypoints()
+            currentWpIdx = 2
+          else
+            currentWaypoints = {}
+          end
+        end
+
+        if #currentWaypoints > 0 and currentWpIdx <= #currentWaypoints then
+          local wp = currentWaypoints[currentWpIdx]
+          if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
+          hum:MoveTo(wp.Position)
+          if (Vector3.new(wp.Position.X - myPos.X, 0, wp.Position.Z - myPos.Z)).Magnitude < 5 then
+            currentWpIdx = currentWpIdx + 1
+          end
+        else
+          hum:MoveTo(targetPos)
+        end
+      else
+        local angle = now * 0.5
+        hum:MoveTo(myPos + Vector3.new(math.cos(angle), 0, math.sin(angle)) * 20)
+      end
+    end
+
+    if hrp.AssemblyLinearVelocity.Magnitude < 2.5 then
+      stuckTicks = stuckTicks + 1
+      if stuckTicks >= 4 then hum.Jump = true; stuckTicks = 0 end
+    else
+      stuckTicks = 0
+    end
+
+    -- 5. Combat: Shoot with best Gun if zombies within 90 studs, else Melee
+    if not usingMed and nearestZombie then
+      local gun = getBestGun(true)
+      local usedGun = reloading
+      if gun and nearestDist <= 90 then
+        local stats = gun:FindFirstChild("Stats")
+        if stats and not stats:GetAttribute("Projectile") then
+          local mag = gun:GetAttribute("Ammo") or 0
+          local ammoType = stats:GetAttribute("AmmoType")
+          local maxMag = stats:GetAttribute("Capacity") or 30
+          local reserve = 0
+          if ammoType == "Energy" then
+            reserve = math.floor((char:GetAttribute("AlienEnergy") or 0) / (stats:GetAttribute("AmmoUse") or 1))
+          elseif ammoType and lp:FindFirstChild("Ammo") then
+            reserve = lp.Ammo:GetAttribute(ammoType) or 0
+          end
+          -- Reload when mag empty (if reserve > 0), or proactively when low (<= 20% of Capacity) and no immediate threat
+          local magLow = mag <= math.max(1, math.floor(maxMag * 0.2))
+          local needReload = (mag <= 0 or (magLow and nearestDist > 20)) and mag < maxMag and reserve > 0
+          if needReload and not reloading then
+            reloading = true
+            usedGun = true
+            task.spawn(function()
+              pcall(function()
+                if gun.Parent ~= char then
+                  hum:EquipTool(gun)
+                  task.wait(0.15)
+                end
+                if not isAlive() or gun.Parent ~= char then return end
+                local sync = gun:FindFirstChild("SyncAmmo")
+                if sync then sync:FireServer() end
+                local rel = gun:FindFirstChild("Reload")
+                if stats:GetAttribute("IndividualReload") then
+                  local spd = 1 + (char:GetAttribute("ReloadSpeed") or 0) + (ammoType and char:GetAttribute("ReloadSpeed_" .. ammoType) or 0)
+                  task.wait((stats:GetAttribute("ReloadTime") or 0.5) / spd)
+                  local reloadOne = gun:FindFirstChild("ReloadOne")
+                  local indivTime = (stats:GetAttribute("ReloadIndividualTime") or 0.5) / spd
+                  while isAlive() and gun.Parent == char and (gun:GetAttribute("Ammo") or 0) < maxMag do
+                    local curRes = (ammoType == "Energy") and math.floor((char:GetAttribute("AlienEnergy") or 0) / (stats:GetAttribute("AmmoUse") or 1))
+                      or (ammoType and lp:FindFirstChild("Ammo") and (lp.Ammo:GetAttribute(ammoType) or 0) or 0)
+                    if curRes <= 0 then break end
+                    task.wait(indivTime)
+                    if not isAlive() or gun.Parent ~= char then break end
+                    if reloadOne then reloadOne:FireServer() end
+                    gun:SetAttribute("Ammo", (gun:GetAttribute("Ammo") or 0) + 1)
+                  end
+                  task.wait((stats:GetAttribute("ReloadEndTime") or 0.3) / spd)
+                  if rel then rel:InvokeServer(false) end
+                  if sync then sync:FireServer() end
+                elseif rel then
+                  local newAmmo = rel:InvokeServer()
+                  if newAmmo then
+                    gun:SetAttribute("Ammo", newAmmo)
+                  elseif sync then
+                    sync:FireServer()
+                  end
+                end
+              end)
+              reloading = false
+            end)
+          elseif mag > 0 and not reloading then
+            usedGun = true
+            if gun.Parent ~= char then
+              hum:EquipTool(gun)
+            else
+              local fireRate = (stats:GetAttribute("FireRate") or 60) * (1 + (char:GetAttribute("FireRate") or 0))
+              if now - lastShot >= 60 / fireRate then
+                lastShot = now
+                local barrel = gun:FindFirstChild("Barrel")
+                local origin = barrel and barrel.WorldPosition or (myPos + Vector3.new(0, 1.5, 0))
+                local targetPart = nearestZombie:FindFirstChild("Head") or nearestZombie:FindFirstChild("Torso") or nearestZombie.PrimaryPart
+                if targetPart then
+                  local aimPos = targetPart.Position
+                  local pellets = stats:GetAttribute("Pellets") or 1
+                  local pen = (stats:GetAttribute("Penetration") or 0) + (char:GetAttribute("GunPenetration") or 0)
+                  local rng = stats:GetAttribute("BulletRange") or 1000
+                  local hitTable = {}
+                  for p = 1, pellets do
+                    local hitData, rayRes, _, effRes = Bullet.BulletHitscan(origin, aimPos, {
+                      Attacker = char,
+                      Penetration = pen,
+                      Range = rng,
+                    })
+                    hitTable[p] = {
+                      Target = rayRes and rayRes.Position or aimPos,
+                      HitData = hitData,
+                      EffectResults = effRes
+                    }
+                  end
+                  shotCounter = shotCounter + 1
+                  gun:SetAttribute("Ammo", mag - 1)
+                  local shootRemote = gun:FindFirstChild("Shoot")
+                  if shootRemote then
+                    pcall(function() shootRemote:FireServer(origin, hitTable, 0, shotCounter) end)
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+
+      if not usedGun and #nearbyTargets > 0 and now - lastAttack > 0.35 then
+        local melee = getBestMelee()
+        if melee then
+          lastAttack = now
+          if melee.Parent ~= char then hum:EquipTool(melee) end
+          local swing = melee:FindFirstChild("Swing")
+          local hitTargets = melee:FindFirstChild("HitTargets")
+          if swing then pcall(function() swing:FireServer() end) end
+          if hitTargets then pcall(function() hitTargets:FireServer(nearbyTargets) end) end
+        end
+      end
+    end
+
+    task.wait(0.1)
+  end
+end)
+
+print("[EndlessSurvivor] Started (RunID " .. tostring(MY_RUN_ID) .. ")")
+]=]
+
+getgenv().__ENDLESS_FULL_SOURCE = "getgenv().__ENDLESS_FULL_SOURCE = [===[" .. FULL_SOURCE .. "]===]\n" .. FULL_SOURCE
+local fn, err = loadstring(FULL_SOURCE)
+if fn then
+  fn()
+else
+  warn("[EndlessSurvivor] Load error:", err)
+end
